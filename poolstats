@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+
+import logging
+import os,sys
+import urllib.request
+import json
+import argparse
+import datetime
+import time
+import socket
+import curses
+import threading
+import queue
+from subprocess import check_output
+from dataclasses import dataclass
+from pwd import getpwnam
+
+formatter_info = logging.Formatter('%(message)s')
+formatter_debug = logging.Formatter('%(levelname)5s %(module)3s.%(funcName)-10s %(lineno)3s %(message)s')
+formatter = logging.Formatter('%(asctime)s  %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+logger = logging.getLogger('poolstats')
+logger.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler("poolstats.log")
+file_handler.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+
+
+IP_URL = 'https://ident.me'
+GRAPH_LEN = 20
+POOL_STATS_URL = 'https://js.adapools.org/pools/{pool_id}/summary.json'
+POOL_STATS_INTERVAL_SECONDS = 5*60
+POOL_LIST_URL = 'https://js.adapools.org/pools.json'
+
+KES_PERIODS = 62
+SLOTS_PER_KES_PERIOD = 129600
+SLOTS_PER_EPOCH = 432000
+FIRST_SLOT_TIMESTAMP = 1506203091
+
+CN_PORT = 3001
+CN_USERNAME = "cardano"
+
+# metric names from JSON
+CN_CONN_PEERS            = 'cardano_node_metrics_connectedPeers_int'
+CN_CUR_EPOCH             = 'cardano_node_metrics_epoch_int'
+CN_CUR_SLOT              = 'cardano_node_metrics_slotNum_int'
+CN_CUR_BLOCK             = 'cardano_node_metrics_blockNum_int'
+CN_CUR_SLOT_IN_EPOCH     = 'cardano_node_metrics_slotInEpoch_int' 
+CN_NODE_UPTIME           = 'cardano_node_metrics_nodeStartTime_int'
+CN_REMAINING_KES_PERIODS = 'cardano_node_metrics_remainingKESPeriods_int'
+CN_CHAIN_DENSITY         = 'cardano_node_metrics_density_real'
+CN_KES_REMAINING         = 'cardano_node_metrics_remainingKESPeriods_int'
+
+
+
+class InputThread(threading.Thread):
+    """ Listen to user input and put it in a queue for further processing in CursedPager """
+    def __init__(self, stdscr, queue, lock):
+        threading.Thread.__init__(self)
+        self._stopped = False
+        self._q = queue
+        self._l = lock
+        self._stdscr = stdscr
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        while not self._stopped:
+            #self._l.wait_for_lock(name='InputThread', debug=True)
+            c = self._stdscr.getch() 
+            #self._l.release_lock()
+
+            if c > 0: 
+                self._q.put(c)
+                logger.debug(c)
+            time.sleep(0.05)
+            curses.flushinp()
+
+
+class Lock():
+    """ Does lock things """
+    def __init__(self, debuggin=False):
+        self._locked = False
+        self._holder = None
+        self._debugging = debuggin
+
+    def is_locked(self):
+        return self._locked
+
+    def do_lock(self):
+        self._locked = True
+
+    def release_lock(self):
+        self._locked = False
+        self._holder = None
+
+    def set_debugging(self, state):
+        self._debugging = state
+
+    def wait_for_lock(self, name='default', debug=False):
+        if debug or self._debugging:
+            class_name = inspect.stack()[1][0].f_locals['self'].__class__.__name__
+            method_name = inspect.stack()[1][3]
+
+        while self.is_locked():
+            if debug or self._debugging:
+                logger.debug(f"[{class_name}.{method_name}] is waiting for lock that is held by {self._holder}...")
+            time.sleep(0.01)
+
+            self._holder = name
+            self.do_lock()
+
+@dataclass
+class Connection():
+    local_ip: str = None
+    remote_ip: str = None
+    local_port: int = None
+    remote_port: int = None
+    state: int = None
+    uid: int = None
+
+    # TCP connection states: https://elixir.bootlin.com/linux/v4.14.42/source/include/net/tcp_states.h
+    _TCP_ESTABLISHED = 1
+    _TCP_LISTEN      = 10
+
+    def is_listening(self):
+        return self.state == Connection._TCP_LISTEN
+
+    def is_established(self):
+        return self.state == Connection._TCP_ESTABLISHED
+
+
+class Metrics():
+    """ Get stats and fill CursedBlock objects with CursedItem objects """
+    def __init__(self, host, port, path, ticker=None):
+        self.host = host
+        self.port = port
+        self.path = path
+        self.ticker = ticker
+        url = f"http://{self.host}:{self.port}/{self.path}"
+
+        self._metrics = self.get_cn_metrics(url)
+        if not self._metrics:
+            raise ConnectionError("Failed to connect to server")
+        self._pool_id = None
+
+    def get_uptime(self):
+        with open('/proc/uptime', 'r') as f:
+            return float(f.readline().split()[0])
+
+    def get_ext_ip(self):
+        try:
+            return urllib.request.urlopen(IP_URL).read().decode('utf8') 
+        except urllib.error.URLError as e:
+            return "Failed to get IP: URLError"
+        except ConnectionResetError as e:
+            return "Failed to get IP: ConnectionError"
+
+    def hex_to_ip(self, string):
+        out = [ str(int(string[i-2:i], 16)) for i in range(len(string), 0, -2)]
+        return ".".join(out)
+
+    def hex_to_port(self, string):
+        return int(string, 16)
+
+    def get_proc(self, only_uid=None):
+        connections = []
+
+        with open('/proc/net/tcp', 'r') as f:
+            proc = f.readlines()
+
+        for line in proc[1:]:
+            l = line.split()
+
+            local_ip, local_port = l[1].split(":")
+            remote_ip, remote_port = l[2].split(":")
+            state = l[3]
+            uid = l[7]
+
+            # only return connections belonging to UID
+            if only_uid != None and only_uid != int(uid):
+                continue
+
+            connections.append(Connection(local_ip    = self.hex_to_ip(local_ip),
+                                          local_port  = int(local_port, 16),
+                                          remote_ip   = self.hex_to_ip(remote_ip),
+                                          remote_port = int(remote_port, 16),
+                                          state       = int(state, 16),
+                                          uid         = int(uid)))
+        return connections
+
+
+    def get_pid_by_name(self, name):
+        return check_output(["pidof",name])
+
+    def get_connections(self):
+        """ Find established connections to port """
+        conn_in = []
+        conn_out = []
+        listen_ports = []
+
+        # get uid of cardano user
+        try:
+            uid = getpwnam(CN_USERNAME)[2]
+        except KeyError:
+            logger.error("Failed to find cardano UID")
+            return [], []
+
+        # find pid of cardano-node process
+        pid = self.get_pid_by_name("cardano-node")
+        if not pid:
+            logger.error("cardano-node process not found")
+            return conn_in, conn_out
+
+        connections = self.get_proc(uid)
+
+        # get list of unique ports that listen for incoming connections
+        listen_ports = [c.local_port for c in connections if c.is_listening() and c.uid == uid]
+
+        # separate incoming/outgoing connections
+        for c in connections:
+            if not c.is_established():
+                continue
+            elif c.local_port == CN_PORT:
+                conn_in.append(c)
+            elif c.local_port in listen_ports:
+                pass
+            else:
+                conn_out.append(c)
+
+        return conn_in, conn_out
+
+    def get_graph(self, value, length, l_chr="█", r_chr="█"):
+        """ Paint a nice colored graph bar """
+        lgraph = int((length / 100) * value) * l_chr
+        rgraph = (length - len(lgraph)) * r_chr
+        return lgraph, rgraph
+
+    def is_core_node(self):
+        """ Check if this is a relay or a core node """
+        return CN_REMAINING_KES_PERIODS in self._metrics.keys()
+
+    def get_time(self, td):
+        """ Convert seconds to time """
+        days, remainder  = divmod(td, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return days, hours, minutes, seconds
+
+    def get_cn_metrics(self, url):
+        """ Source metrics from cardano prometheus port """
+        try:
+            response = urllib.request.urlopen(url)
+        except urllib.error.HTTPError as e:
+            logger.error(e)
+            return {}
+        except ConnectionRefusedError as e:
+            logger.error(e)
+            return {}
+        except urllib.error.URLError as e:
+            logger.error(e)
+            return {}
+
+
+        data = response.read().decode()
+        metrics = {}
+
+        for l in data.split("\n"):
+            try:
+                k,v = l.split()
+            except ValueError:
+                pass
+            metrics[k] = float(v)
+
+        return metrics
+
+    def get_node_stats(self):
+        items = []
+        try:
+            pos_in_epoch  = int(self._metrics[CN_CUR_SLOT_IN_EPOCH] / SLOTS_PER_EPOCH *100)
+            cur_epoch     = self._metrics[CN_CUR_EPOCH]
+            cur_slot      = self._metrics[CN_CUR_SLOT]
+            cur_block     = self._metrics[CN_CUR_BLOCK]
+            conn_peers    = self._metrics[CN_CONN_PEERS]
+            chain_density = self._metrics[CN_CHAIN_DENSITY]
+        except KeyError as e:
+            #node_stats.add(["Failed to get node stats", f"missing key: {e}"])
+            return node_stats.get_lines()
+
+        items.append(CursedItem(0, 0, "Node Stats", "blue"))
+        items.append(CursedItem(1, 0, "Current Block"))
+        items.append(CursedItem(1, 1, f"{cur_block:,.0f}"))
+
+        items.append(CursedItem(2, 0, "Current Slot"))
+        items.append(CursedItem(2, 1, f"{cur_slot:,.0f}"))
+
+        items.append(CursedItem(3, 0, "Chain density"))
+        items.append(CursedItem(3, 1, f"{chain_density:.3f}"))
+        return items
+
+    def get_machine_stats(self):
+        node_uptime         = datetime.datetime.fromtimestamp(self._metrics[CN_NODE_UPTIME])
+        node_uptime_elapsed = datetime.datetime.utcnow() - node_uptime
+        machine_uptime      = time.strftime("%d days, %H:%M:%S", time.gmtime(int(self.get_uptime())))
+        conn_in, conn_out   = self.get_connections()
+        d, h, m, s          = self.get_time(node_uptime_elapsed.total_seconds())
+        tot_m, used_m, free_m = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+        mem = int((used_m / tot_m) * 100)
+        lgraph, rgraph    = self.get_graph(mem, GRAPH_LEN)
+
+        items = []
+
+        items.append(CursedItem(0, 0, "Machine Stats", "blue"))
+        items.append(CursedItem(1, 0, "Metrics from"))
+        items.append(CursedItem(1, 1, f"{self.host}:{self.port}"))
+        items.append(CursedItem(2, 0, "Machine uptime"))
+        items.append(CursedItem(2, 1, f"{machine_uptime.lstrip('0')}"))
+        items.append(CursedItem(3, 0, "Node uptime"))
+        items.append(CursedItem(3, 1, f"{int(d)} days, {int(h)}:{int(m)}:{int(s)}"))
+        items.append(CursedItem(4, 0, "Connections in/out"))
+
+        if not conn_in or not conn_out:
+            items.append(CursedItem(4, 1, "Failed to get connections info", "red"))
+        else:
+            items.append(CursedItem(4, 1, f"{len(conn_in)} / {len(conn_out)}", "green"))
+
+        items.append(CursedItem(5, 0, "RAM"))
+        items.append(CursedItem(5, 1, lgraph, "magenta"))
+        items.append(CursedItem(5, 1, rgraph))
+        items.append(CursedItem(5, 1, f" {mem}%"))
+        return items
+
+    def get_conn_stats(self):
+        items = []
+        conn_in, conn_out = self.get_connections()
+
+        if not conn_in or not conn_out:
+            logger.error("Failed to get connections info")
+            items.append(CursedItem(0, 0, "Failed to get connections info", "red"))
+            return items
+
+        items.append(CursedItem(0, 0, ""))
+        items.append(CursedItem(0, 1, "local address", "blue"))
+        items.append(CursedItem(0, 2, "port", "blue"))
+        items.append(CursedItem(0, 3, "remote address", "blue"))
+        items.append(CursedItem(0, 4, "port", "blue"))
+
+        i = 1
+
+        for c in conn_in:
+            items.append(CursedItem(i, 0, "IN", "magenta"))
+            items.append(CursedItem(i, 1, f"{c.local_ip}"))
+            items.append(CursedItem(i, 2, f"{c.local_port}"))
+            items.append(CursedItem(i, 3, f"{c.remote_ip}"))
+            items.append(CursedItem(i, 4, f"{c.remote_port}"))
+            i += 1
+
+        for c in conn_out:
+            items.append(CursedItem(i, 0, "OUT", "blue"))
+            items.append(CursedItem(i, 1, f"{c.local_ip}"))
+            items.append(CursedItem(i, 2, f"{c.local_port}"))
+            items.append(CursedItem(i, 3, f"{c.remote_ip}"))
+            items.append(CursedItem(i, 4, f"{c.remote_port}"))
+            i += 1
+        return items
+
+    def get_host_stats(self):
+        items = []
+        if self.is_core_node():
+            items.append(CursedItem(0, 0, "CORE", "green"))
+        else:
+            items.append(CursedItem(0, 0, "RELAY", "magenta"))
+
+        items.append(CursedItem(0, 1, socket.gethostname(), "blue"))
+        items.append(CursedItem(0, 2, self.get_ext_ip(), "red"))
+        return items
+
+    def get_kes_stats(self):
+        if not self.is_core_node():
+            return 0
+        items = []
+
+        try:
+            kes_remaining = self._metrics[CN_KES_REMAINING]
+        except KeyError:
+            items.append(CursedItem(0, 0, "Failed to get KES data"))
+            items.append(CursedItem(0, 1, f"missing key: {e}"))
+            return items
+
+        kes_time_remaining = (kes_remaining * SLOTS_PER_KES_PERIOD) / (60*60*24)
+        kes_progress_perc = int(((KES_PERIODS-kes_remaining)/KES_PERIODS)*100)
+        lgraph, rgraph = self.get_graph(kes_progress_perc, GRAPH_LEN)
+
+        items.append(CursedItem(0, 0, "KES progress"))
+        items.append(CursedItem(0, 1, lgraph, "blue"))
+        items.append(CursedItem(0, 1, rgraph))
+        items.append(CursedItem(0, 1, f" {kes_progress_perc}%"))
+
+        items.append(CursedItem(1, 0, "KES remaining"))
+        items.append(CursedItem(1, 1, f"{kes_remaining} periods / {kes_time_remaining:.1f} days"))
+        return items
+
+    def get_pool_stats(self):
+        items = []
+
+        if not self.ticker:
+            return items
+
+        # get pool id by ticker from adapools
+        if not self._pool_id:
+            try:
+                req = urllib.request.Request(POOL_LIST_URL, headers={'User-Agent': 'Mozilla/5.0'})
+                js = json.loads(urllib.request.urlopen(req).read().decode('utf8'))
+            except urllib.error.URLError as e:
+                logger.error(f"Failed to get pool list", "{e}")
+                items.append(CursedItem(0, 0, f"Failed to get pool list", "{e}"))
+                return items
+
+            for pool_id, data in js.items():
+                if data["db_ticker"] == self.ticker:
+                    self._pool_id = pool_id
+                    logger.debug(f"Got pool id: {self._pool_id}")
+                    break
+            else:
+                logger.error(f"Failed to find ticker: {self.ticker}")
+                items.append(CursedItem(0, 0, f"Failed to find ticker:", "red"))
+                items.append(CursedItem(0, 1, f"{self.ticker}", "red"))
+                return items
+
+        # get pool data
+        try:
+            url = POOL_STATS_URL.format(pool_id=self._pool_id)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            js = json.loads(urllib.request.urlopen(req).read().decode('utf8'))["data"]
+        except urllib.error.URLError as e:
+            logger.error(f"Failed to get pool data, {e}")
+            items.append(CursedItem(0, 0, f"Failed to get pool data", "red"))
+            items.append(CursedItem(0, 1, f"{e}", "red"))
+            return items
+
+        items.append(CursedItem(0, 0, "Pool stats", "blue"))
+        items.append(CursedItem(1, 0, "Ticker:"))
+        items.append(CursedItem(1, 1, js["db_ticker"], "green"))
+        items.append(CursedItem(2, 0, "ROA"))
+        items.append(CursedItem(2, 1, str(js["roa"])))
+        items.append(CursedItem(3, 0, "Pool id"))
+        items.append(CursedItem(3, 1, str(js["pool_id"])))
+        items.append(CursedItem(4, 0, "Pledge"))
+        items.append(CursedItem(4, 1, f"{int(js['pledge'])/1000000:,.0f} ada"))
+        items.append(CursedItem(5, 0, "Delegators"))
+        items.append(CursedItem(5, 1, str(js["delegators"])))
+        items.append(CursedItem(6, 0, "Rank"))
+        items.append(CursedItem(6, 1, str(js["rank"])))
+        items.append(CursedItem(7, 0, "Total stake"))
+        items.append(CursedItem(7, 1, f"{int(js['total_stake'])/1000000:,.0f} ada"))
+        items.append(CursedItem(8, 0, "Blocks epoch"))
+        items.append(CursedItem(8, 1, str(js["blocks_epoch"])))
+        items.append(CursedItem(9, 0, "Blocks lifetime"))
+        items.append(CursedItem(9, 1, str(js["blocks_lifetime"])))
+
+        return items
+
+
+class CursedColors():
+    """ Generate color pairs and provide method to get the right pair index by fg/bg colors """
+    def __init__(self):
+        self._color_mapping = {}
+        self._color_mapping['red']     = curses.COLOR_RED
+        self._color_mapping['green']   = curses.COLOR_GREEN
+        self._color_mapping['yellow']  = curses.COLOR_YELLOW
+        self._color_mapping['blue']    = curses.COLOR_BLUE
+        self._color_mapping['magenta'] = curses.COLOR_MAGENTA
+        self._color_mapping['cyan']    = curses.COLOR_CYAN
+        self._color_mapping['white']   = curses.COLOR_WHITE
+        self._color_mapping['black']   = 8
+
+        self.init_colors()
+
+    def init_colors(self):
+        index = 1
+
+        for fg_name,fg_c in self._color_mapping.items():
+            for bg_name,bg_c in self._color_mapping.items():
+                curses.init_pair(index, fg_c, bg_c)
+                index += 1
+
+    def get_pair(self, fg, bg):
+        index = 1
+
+        for fg_name,fg_c in self._color_mapping.items():
+            for bg_name,bg_c in self._color_mapping.items():
+                if fg_name == fg and bg_name == bg:
+                    return index
+                index += 1
+
+
+@dataclass
+class CursedItem():
+    """ These are the text blocks that are fed to CursedBlock objects to put them into columns
+        And then fed into the CursedPager object to print them out on terminal. """
+    y: int
+    col: int
+    text: str
+    fg_color: str = "white"
+    bg_color: str = "black"
+    x: int = None
+
+
+class CursedBlock(CursedColors):
+    """ CursedItem objects are added here and orders the items into columns """
+    def __init__(self, callback=None, interval=5, prefix='', prefix_color='white', header=[], header_color="blue"):
+        CursedColors.__init__(self)
+        self._prefix = prefix
+        self._prefix_color = prefix_color
+        self._header = header
+        self._header_color = header_color
+
+        self._items = []
+
+        self._last_check = None
+        self._interval = interval
+
+        self._callback = callback
+
+    def set(self, items):
+        self._items = items
+
+    def amount_lines(self):
+        # +1 because lines start at 0
+        return max([i.y+1 for i in self._items], default=0)
+
+    def columnize(self, items, spaces=2):
+        cols = list(set([x.col for x in items]))
+        rows = list(set([x.y for x in items]))
+
+        lines = []
+        for row in rows:
+            lines.append([x for x in items if x.y == row])
+
+        # find maximum lengths per column
+        max_col_lengths = [0 for x in list(set([x.col for x in items]))]
+
+        for col in list(set([x.col for x in items])):
+            for y in list(set([x.y for x in items])):
+                col_len = sum([len(item.text) for item in items if item.y == y and item.col == col])
+                if col_len > max_col_lengths[col]:
+                    max_col_lengths[col] = col_len
+
+        # calculate start positions for every column, add in space inbetween columns
+        x_start_pos = [ sum(max_col_lengths[:i]) + (spaces*i) + len(self._prefix) for i,x in enumerate(max_col_lengths)]
+
+        # define x positions in items
+        for n,line in enumerate(lines):
+
+            ## draw prefix, and not on header
+            #if self._prefix and n > 0:
+            #    y = next(x.y for x in line)
+            #    items.append(CursedItem(y, None, self._prefix, x=0, fg_color=self._prefix_color))
+
+
+            x_latest_pos = x_start_pos.copy()
+            for item in line:
+                item.x = x_latest_pos[item.col]
+                x_latest_pos[item.col] += len(item.text)
+        
+        return items
+
+    def get_items(self):
+        if self._last_check:
+            if datetime.datetime.utcnow() - self._last_check < datetime.timedelta(seconds=self._interval):
+                return self._items
+
+        self._items = self._callback()
+        self._items = self.columnize(self._items)
+        self._last_check = datetime.datetime.utcnow()
+        return self._items
+
+
+class CursedPager(CursedColors):
+    """ Handles all curses things, prints to terminal checks for term resizes etc... """
+    def __init__(self, stdscr):
+        CursedColors.__init__(self)
+        self._stdscr = stdscr
+
+        # keep track of previous term dimensions to detect resizes
+        self._old_term_xy = self._stdscr.getmaxyx()
+
+        # CursedItems list
+        self._blocks = []
+
+        # keep track of top line number
+        self._pos = 0
+
+        # paint background default terminal colors
+        self._stdscr.bkgd(' ', curses.color_pair(self.get_pair('white', 'black')))
+
+        # turn off cursor
+        curses.curs_set(False)
+
+        # don't press enter after input
+        curses.cbreak()
+
+        # enable arrow keys, escape etc
+        stdscr.keypad(True)
+
+        # put user input in queue
+        self._q = queue.Queue()
+        
+        # create lock instance to make sure we don't write to stdscr accross threads
+        self._lock = Lock()
+
+        # start a thread to listen for user input
+        self._inp_thread = InputThread(self._stdscr, self._q, self._lock)
+        self._inp_thread.start()
+
+    def stop(self):
+        self._inp_thread.stop()
+        self._inp_thread.join()
+        curses.curs_set(True)
+        curses.nocbreak()
+
+    def get_cols(self):
+        return self._stdscr.getmaxyx()[1]
+
+    def get_rows(self):
+        return self._stdscr.getmaxyx()[0]
+
+    def set_string(self, y, x, string, fg_color='white', bg_color='black', reverse=False, dim=False):
+        args = 0
+        pair = self.get_pair(fg_color, bg_color)
+        args |= curses.color_pair(pair)
+
+        if reverse:
+            args |= curses.A_REVERSE
+        if dim:
+            args |= curses.A_DIM
+
+        try:
+            #self._lock.wait_for_lock(name='CursedPager.set_string')
+            self._stdscr.addstr(y, x, string, args)
+            #self._lock.release_lock()
+        except curses.error as e:
+            raise IndexError(f"ERROR: Failed to set string: {x},{y} '{string}'")
+
+    def is_resized(self):
+        if self._old_term_xy != self._stdscr.getmaxyx():
+            self._old_term_xy = self._stdscr.getmaxyx()
+            logger.debug("is resized")
+            return True
+
+    def add_block(self, block):
+        self._blocks.append(block)
+
+    def add_item(self, item):
+        self._items.append(item)
+
+    def clear(self):
+        #self._lock.wait_for_lock(name='CursedPager.clear')
+        self._stdscr.clear()
+        #self._lock.release_lock()
+
+    def erase(self):
+        #self._lock.wait_for_lock(name='CursedPager.erase')
+        self._stdscr.erase()
+        #self._lock.release_lock()
+
+    def refresh(self):
+        #self._lock.wait_for_lock(name='CursedPager.refresh')
+        self._stdscr.refresh()
+        #self._lock.release_lock()
+
+    def resize_term(self, y, x):
+        #self._lock.wait_for_lock(name='CursedPager.resize_term')
+        curses.resizeterm(y, x)
+        #self._lock.release_lock()
+
+    def sleep(self, t):
+        """ Sleep method that checks for resizes and user input while waiting """
+        t_start = datetime.datetime.utcnow()
+        while (datetime.datetime.utcnow() - t_start) < datetime.timedelta(seconds=t):
+
+            # redraw terminal on resize
+            if self.is_resized():
+                self.clear()
+                self.resize_term(*self._stdscr.getmaxyx())
+                self.display()
+                return
+        
+            if self.handle_input(self._q):
+                logger.debug("was input")
+                self.display()
+
+            time.sleep(0.01)
+
+    def get_last_row_number(self):
+        return max(i.y for i in self._items)
+
+    def handle_input(self, q):
+        if self._q.empty():
+            return
+
+        c = self._q.get()
+
+        if c in [ord('q'), 27]:
+            raise KeyboardInterrupt
+
+        elif c in [ord('j'), curses.KEY_DOWN]:
+            # dont scroll if everything fits on screen
+            if self._line_counter-2 > self._pos:
+                self._pos += 1
+                return True
+
+        elif c in [ord('k'), curses.KEY_UP]:
+            if self._pos != 0:
+                self._pos -= 1
+                return True
+
+        elif c in [ord('g')]:
+            self._pos = 0
+            return True
+
+        elif c in [ord('G')]:
+            logger.debug(self._line_counter)
+            # fits on one screen
+            if self._line_counter < self.get_rows()-1:
+                return
+            self._pos = self._line_counter-self.get_rows()-1
+            return True
+
+    def fits_on_screen(self, y, x, string):
+        x += len(string)
+        if x > self.get_cols() or y > self.get_rows():
+            return string[:self.get_cols()-x-3] + '...'
+        return string
+
+    def display(self):
+        """ Print lines to screen """
+        self.erase()
+        self._line_counter = 0
+
+        for b in self._blocks:
+            for i in b.get_items():
+                try:
+                    string = self.fits_on_screen(i.y-self._pos + self._line_counter, i.x, i.text)
+                    self.set_string(i.y - self._pos + self._line_counter, i.x, string, i.fg_color, i.bg_color)
+                except IndexError:
+                    pass
+
+            # increment amount of lines
+            self._line_counter += b.amount_lines() + 1 if b.amount_lines() > 0 else 0
+
+        self.refresh()
+
+
+class App():
+    def __init__(self, stdscr):
+        self._stdscr = stdscr
+        s = CursedPager(self._stdscr)
+        try:
+            self.run(s)
+        except KeyboardInterrupt:
+            s.stop()
+
+    def parse_args(self):
+        parser = argparse.ArgumentParser(description='Monitor cardano node.')
+        parser.add_argument('-p', '--port',        help="default: 12798", type=int, default=12798)
+        parser.add_argument('-H', '--host',        help="default: localhost", default="localhost")
+        parser.add_argument('-P', '--path',        help="default: metrics", default="metrics")
+        parser.add_argument('-i', '--interval',    help="default: 5", type=int, default=5)
+        parser.add_argument('-t', '--ticker',      help="ticker", default=None)
+        parser.add_argument('-d', '--debug',       help="enable debugging", action='store_true')
+        args = parser.parse_args()
+
+        self.port    = args.port
+        self.host    = args.host
+        self.path    = args.path
+        self.interval = int(args.interval)
+        self.ticker  = args.ticker
+
+        if args.debug:
+            logger.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter_debug)
+        else:
+            logger.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter_info)
+
+        # NOTE remove this line after testing
+        logger.setLevel(logging.DEBUG)
+
+    def run(self, s):
+        self.parse_args()
+
+        m = Metrics(self.host, self.port, self.path, self.ticker)
+
+        s.add_block(CursedBlock(callback=m.get_host_stats))
+        s.add_block(CursedBlock(callback=m.get_machine_stats))
+        s.add_block(CursedBlock(callback=m.get_pool_stats, interval=60))
+        s.add_block(CursedBlock(callback=m.get_node_stats))
+        s.add_block(CursedBlock(callback=m.get_kes_stats))
+        s.add_block(CursedBlock(callback=m.get_conn_stats))
+
+        while True:
+            s.display()
+            s.sleep(self.interval)
+
+
+if __name__ == "__main__":
+    os.environ.setdefault('ESCDELAY', '25')
+    curses.wrapper(App)
